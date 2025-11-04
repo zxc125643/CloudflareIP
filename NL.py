@@ -2,57 +2,26 @@ import socket
 import threading
 import queue
 import time
-import re
 import requests
+import re
 
 # ========================
-# 参数配置
+# 配置参数
 # ========================
-TEST_TIMEOUT = 2          # 单个节点超时时间（秒）
-TEST_PORT = 443           # 测试端口
-MAX_THREADS = 50          # 并发线程数
-TOP_NODES = 60            # 取前 60 个节点进行国家检测
-TXT_OUTPUT_FILE = "HK.txt"  # 输出文件名
+TEST_TIMEOUT = 2
+TEST_PORT = 443
+MAX_THREADS = 50
+TOP_NODES = 80
+TXT_OUTPUT_FILE = "HK.txt"
+
+# Cloudflare 香港常见网段
+BASE_RANGES = [
+    "104.28.193", "104.28.194", "104.28.195",
+    "104.28.196", "104.28.197", "104.28.198", "104.28.199"
+]
 
 # ========================
-# 国家映射
-# ========================
-COUNTRY_CODES = {
-    "HK": "中国香港",
-    "JP": "日本",
-    "US": "美国",
-    "SG": "新加坡",
-    "TW": "台湾",
-    "KR": "韩国",
-    "GB": "英国",
-    "DE": "德国",
-    "FR": "法国",
-    "CN": "中国大陆",
-}
-
-# ========================
-# IP 查询函数（快速）
-# ========================
-def get_ip_country(ip):
-    try:
-        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=2)
-        data = r.json()
-        country = data.get("country", "")
-        return COUNTRY_CODES.get(country, country or "未知")
-    except Exception:
-        return "未知"
-
-# ========================
-# IP 清理函数
-# ========================
-def clean_ip(ip_str):
-    ip_str = ip_str.strip()
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip_str):
-        return ip_str
-    return None
-
-# ========================
-# Cloudflare 节点测速类
+# 节点测速类
 # ========================
 class CloudflareNodeTester:
     def __init__(self):
@@ -61,29 +30,31 @@ class CloudflareNodeTester:
         self.lock = threading.Lock()
 
     def fetch_known_nodes(self):
-        """仅取常见 Cloudflare 香港段"""
-        base_ranges = [
-            "104.16", "104.17", "104.18",
-            "172.64", "172.65",
-            "188.114"
-        ]
         nodes = []
-        for base in base_ranges:
-            for i in range(0, 4):       # C 段
-                for j in range(1, 26):  # D 段
-                    ip = f"{base}.{i}.{j}"
-                    nodes.append(ip)
-        return nodes
+        for base in BASE_RANGES:
+            for i in range(1, 50):  # 每个网段生成 49 个 IP
+                nodes.append(f"{base}.{i}")
+        self.nodes = nodes
 
     def test_node_speed(self, ip):
-        """测试单个节点延迟"""
+        """测速 + 获取 colo"""
         try:
             start = time.time()
+            # TCP 测试端口连通性
             sock = socket.create_connection((ip, TEST_PORT), timeout=TEST_TIMEOUT)
             sock.close()
             latency = (time.time() - start) * 1000
+
+            # 请求 /cdn-cgi/trace 获取 colo
+            try:
+                r = requests.get(f"https://{ip}/cdn-cgi/trace", timeout=TEST_TIMEOUT, verify=False)
+                m = re.search(r"colo=(\w+)", r.text)
+                colo = m.group(1) if m else "未知"
+            except Exception:
+                colo = "未知"
+
             with self.lock:
-                self.results.append((ip, latency))
+                self.results.append((ip, latency, colo))
         except Exception:
             pass
 
@@ -96,69 +67,60 @@ class CloudflareNodeTester:
             q.task_done()
 
     def test_all_nodes(self):
-        """多线程测速"""
         q = queue.Queue()
         for ip in self.nodes:
             q.put(ip)
-
         threads = []
         for _ in range(MAX_THREADS):
             t = threading.Thread(target=self.worker, args=(q,))
             t.start()
             threads.append(t)
-
         q.join()
-
         for _ in threads:
             q.put(None)
         for t in threads:
             t.join()
 
-    def quick_filter(self):
-        """只保留延迟最低的前 N 个节点"""
-        return sorted(self.results, key=lambda x: x[1])[:TOP_NODES]
-
     def run(self):
-        print("🚀 正在获取 Cloudflare 节点...")
-        self.nodes = self.fetch_known_nodes()
-        print(f"共获取 {len(self.nodes)} 个节点，开始测速...\n")
+        print("🚀 正在生成 Cloudflare 节点列表...")
+        self.fetch_known_nodes()
+        print(f"共生成 {len(self.nodes)} 个节点，开始测速...\n")
 
         start_time = time.time()
         self.test_all_nodes()
+
         if not self.results:
             print("❌ 无可用节点。")
             return
 
-        fast_nodes = self.quick_filter()
-        print(f"📊 选出延迟最低的 {len(fast_nodes)} 个节点，开始查询地理位置...\n")
-
-        display_list = []
-        for ip, latency in fast_nodes:
-            country = get_ip_country(ip)
-            display_list.append((ip, latency, country))
-
-        hk_list = [r for r in display_list if "香港" in r[2] or "Hong Kong" in r[2]]
-        if not hk_list:
+        # 只保留 colo=HKG
+        hk_nodes = [r for r in self.results if r[2] == "HKG"]
+        if not hk_nodes:
             print("⚠️ 未检测到香港节点，保存所有节点。")
-            hk_list = display_list
+            hk_nodes = self.results
+
+        # 按延迟排序
+        hk_nodes.sort(key=lambda x: x[1])
 
         # 打印结果
         print("\n🏁 最快节点（香港）:")
-        for ip, latency, country in hk_list:
-            print(f"{ip:<15} {latency:.2f} ms  {country}")
+        for ip, latency, colo in hk_nodes[:TOP_NODES]:
+            print(f"{ip:<15} {latency:.2f} ms  {colo}")
 
-        # 保存文件
+        # 保存到 HK.txt
         with open(TXT_OUTPUT_FILE, "w", encoding="utf-8") as f:
-            for ip, latency, country in hk_list:
-                f.write(f"{ip}#hk {country} HK\n")
+            for ip, latency, colo in hk_nodes:
+                f.write(f"{ip}:443#hk HKG {latency:.2f}ms\n")
 
-        end_time = time.time()
-        print(f"\n✅ 已保存结果到 {TXT_OUTPUT_FILE}")
-        print(f"⏱️ 总耗时：{end_time - start_time:.1f} 秒")
+        print(f"\n✅ 已保存 {len(hk_nodes)} 条香港节点到 {TXT_OUTPUT_FILE}")
+        print(f"⏱️ 总耗时：{time.time() - start_time:.1f} 秒")
+
 
 # ========================
-# 主程序入口
+# 主程序
 # ========================
 if __name__ == "__main__":
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     tester = CloudflareNodeTester()
     tester.run()
